@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '0 */3 * * *'
+
+jobs:
+  build_publish:
+    # The type of runner that the job will run on
+    runs-on: windows-latest
+    env:
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      DOTNET_NOLOGO: true
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - uses: actions/checkout@v2
+      with:
+        submodules: 'recursive'
+
+    - uses: actions/cache@v2.1.1
+      name: Cache nuget
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+
+    - uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: '3.1.x'
+
+    - name: Restore using netcore
+      run: dotnet restore
+      timeout-minutes: 5
+
+    - name: Build Release
+      run: dotnet build --configuration Release
+      timeout-minutes: 5
+
+    - name: Lock using Turnstyle
+      timeout-minutes: 15
+      uses: softprops/turnstyle@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Run Release
+      env:
+        ZY_CODEDECEPTION__LOGIN: ${{ secrets.ZY_CODEDECEPTION__LOGIN }}
+        ZY_CODEDECEPTION__PASSWORD: ${{ secrets.ZY_CODEDECEPTION__PASSWORD }}
+      run: |
+            cd ZygorDownloader
+            dotnet run --configuration Release
+      timeout-minutes: 15
+
+    - name: Setup git
+      id: setup_git
+      timeout-minutes: 3
+      shell: bash
+      run: |
+            set -x
+            git fetch --tags --all
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+
+    - name: Export env
+      shell: python
+      run: |
+            import json
+            from pathlib import Path
+            import os
+
+            def set_env(name: str, value: str):
+              with open(os.getenv("GITHUB_ENV"), 'a', encoding='UTF-8') as f:
+                return print(f"{name}={value}", file=f)
+
+            retail_zip = next(Path(".").glob("**/ZygorGuidesViewer.zip"))
+            set_env("RETAIL_ZIP", str(retail_zip.absolute()))
+            set_env("RETAIL_FOLDER", str(retail_zip.parent.absolute()))
+            retail_json = json.loads(next(Path(".").glob("**/ZygorGuidesViewer.json")).read_text())
+            set_env("RETAIL_REVISION", retail_json['Revision'])
+
+            classic_zip = next(Path(".").glob("**/ZygorGuidesViewerClassic.zip"))
+            set_env("CLASSIC_ZIP", str(classic_zip.absolute()))
+            set_env("CLASSIC_FOLDER", str(classic_zip.parent.absolute()))
+            classic_json = json.loads(next(Path(".").glob("**/ZygorGuidesViewerClassic.json")).read_text())
+            set_env("CLASSIC_REVISION", classic_json['Revision'])
+
+    - name: Manage Tag
+      timeout-minutes: 1
+      shell: bash
+      run: |
+            set -x
+
+            git ls-remote --exit-code origin "refs/tags/v${RETAIL_REVISION}" &&
+            echo "NEW_RETAIL_RELEASE=" >> $GITHUB_ENV ||
+            echo "NEW_RETAIL_RELEASE=1" >> $GITHUB_ENV
+            git tag "v${RETAIL_REVISION}" || :
+
+            git ls-remote --exit-code origin "refs/tags/v${CLASSIC_REVISION}" &&
+            echo "NEW_CLASSIC_RELEASE=" >> $GITHUB_ENV ||
+            echo "NEW_CLASSIC_RELEASE=1" >> $GITHUB_ENV
+            git tag "v${CLASSIC_REVISION}" || :
+
+
+            git ls-remote --exit-code origin "refs/tags/v_r${RETAIL_REVISION}_c${CLASSIC_REVISION}" &&
+            echo "NEW_RELEASE=" >> $GITHUB_ENV ||
+            echo "NEW_RELEASE=1" >> $GITHUB_ENV
+            git tag "v_r${RETAIL_REVISION}_c${CLASSIC_REVISION}" || :
+
+            git push -f --tags
+
+    - name: Create artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: zygor_all
+        path: |
+                ${{ env.RETAIL_FOLDER }}
+                ${{ env.CLASSIC_FOLDER }}
+
+    - name: Create retail artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: zygor_retail
+        path: |
+                ${{ env.RETAIL_FOLDER }}/ZygorGuidesViewer.*
+
+    - name: Create classic artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: zygor_classic
+        path: |
+                ${{ env.CLASSIC_FOLDER }}/ZygorGuidesViewerClassic.*
+
+
+    - name: Delete Draft Releases
+      uses: hugo19941994/delete-draft-releases@v0.1.0
+      if: success() && env.NEW_RELEASE == '1'
+      continue-on-error: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+    - name: Create Release
+      id: create_release
+      if: success() && env.NEW_RELEASE == '1'
+      continue-on-error: true
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: "v_r${{ env.RETAIL_REVISION }}_c${{ env.CLASSIC_REVISION }}"
+        release_name: retail ${{ env.RETAIL_REVISION }} + classic ${{ env.CLASSIC_REVISION }}
+        prerelease: false
+
+    - name: Upload retail Asset
+      id: upload-retail-asset
+      if: success() && env.NEW_RELEASE == '1'
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ${{ env.RETAIL_ZIP }}
+        asset_name: ZygorGuidesViewer.zip
+        asset_content_type: "application/zip"
+
+    - name: Upload classic Asset
+      uses: actions/upload-release-asset@v1
+      id: upload-classic-asset
+      if: success() && env.NEW_RELEASE == '1'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ${{ env.CLASSIC_ZIP }}
+        asset_name: ZygorGuidesViewerClassic.zip
+        asset_content_type: "application/zip"
